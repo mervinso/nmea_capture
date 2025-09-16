@@ -1,3 +1,8 @@
+//! Orquestación del binario `nmea-capture`:
+//! - Socket UDP (productor).
+//! - Canal MPSC como buffer (backpressure y desacople).
+//! - Tarea consumidora que imprime (texto/JSON) y, si se pide, publica a DDS.
+
 use crate::cli::Cli;
 use crate::dds_types::{RawSentence, Source};
 use crate::net::udp::UdpReceiver;
@@ -14,7 +19,10 @@ use dust_dds::{
     infrastructure::{qos::QosKind, status::NO_STATUS},
 };
 
-/// WinSock (Windows)
+/// En Windows, algunos crates de red exigen que WinSock esté inicializado.
+/// Lo hacemos **una sola vez** y de forma segura.
+/// `WSAStartup` corresponde a `MAKEWORD(2,2)`; `Once` garantiza idempotencia.
+/// Si falla la inicialización, se aborta con un `assert_eq!`.
 #[cfg(windows)]
 fn ensure_winsock() {
     use std::sync::Once;
@@ -27,11 +35,20 @@ fn ensure_winsock() {
     });
 }
 
+/// Arma el pipeline completo:
+/// 1) Crea un canal **mpsc** con capacidad 1024 (buffer de backpressure).
+/// 2) Spawnea la tarea **productora** que lee UDP y envía (Vec<u8>, SocketAddr).
+/// 3) (Opcional) Inicializa **DustDDS** y un `DataWriter<RawSentence>`.
+/// 4) Spawnea la tarea **consumidora** (impresor + publisher opcional).
+/// 5) Espera `Ctrl+C` y realiza un cierre ordenado.
 pub async fn run(cfg: Cli) -> Result<()> {
     // Canal productor UDP -> consumidor impresor
     let (tx, mut rx) = mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024);
 
-    // Tarea UDP
+    // Tarea **productora UDP**:
+    // - Enlaza `UdpReceiver` al `bind`.
+    // - En bucle, recibe datagramas y los manda por `tx`.
+    // - Si no puede enlazar, aborta con `expect` (error visible en arranque).
     {
         let bind = cfg.bind.clone();
         let tx2 = tx.clone();
@@ -48,7 +65,13 @@ pub async fn run(cfg: Cli) -> Result<()> {
     let json = cfg.json;
     let json_pretty = cfg.json_pretty;
 
-    // ---------- DDS ----------
+    // Inicialización **opcional** de DDS:
+    // - `DomainParticipantFactoryAsync::get_instance()`
+    // - `create_participant(domain, QosKind::Default, ...)`
+    // - `create_topic::<RawSentence>(name, "RawSentence", ...)`
+    //   Nota: la cadena `"RawSentence"` debe coincidir con el nombre del tipo generado por `DdsType`.
+    // - `create_publisher(...)`, `create_datawriter(...)`
+    // Guardamos `writer` en `dds_writer` para usarlo dentro de la tarea consumidora.
     let mut dds_writer = None;
     if cfg.dds {
         #[cfg(windows)]
@@ -79,7 +102,13 @@ pub async fn run(cfg: Cli) -> Result<()> {
         dds_writer = Some(writer);
     }
 
-    // ---------- print + publish DDS ----------
+    // Tarea **caturador**:
+    // - Recibe desde el canal, trocea el buffer en líneas NMEA (`split_crlf_lines`).
+    // - Imprime:
+    //   - Texto con timestamp si `--timestamp`
+    //   - o **NDJSON** si `--json` (`--json-pretty` cambia formato).
+    // - Si `dds_writer` existe, construye un `RawSentence` y lo publica con `write()`.
+    // El `seq` local se usa como `id` en DDS (clave de instancia).
     let mut seq: u64 = 0;
     let printer = tokio::spawn(async move {
         while let Some((buf, peer)) = rx.recv().await {
@@ -140,14 +169,20 @@ pub async fn run(cfg: Cli) -> Result<()> {
         debug!("Printer loop ended");
     });
 
-    // CTRL+C para salir
+    // Mecanismo de salida ordenada:
+    // - `signal::ctrl_c().await` bloquea hasta CTRL+C.
+    // - Al liberar `rx`, la tarea consumidora terminará el bucle.
+    // - `printer.await` sincroniza el cierre y permite registrar "Printer loop ended".
     signal::ctrl_c().await.context("waiting for Ctrl+C failed")?;
     info!("Ctrl+C received, shutting down…");
     let _ = printer.await;
     Ok(())
 }
 
-// igual que antes
+/// Extrae `(talker, sentence)` de una línea NMEA:
+/// - Si comienza por `$` o `!` y tiene al menos 6 chars: [1..3] y [3..6].
+/// - En cualquier otro caso devuelve ("??","UNK") como valores de fallback.
+/// Nota: no valida checksum; esta función es un **split rápido** para etiquetar.
 fn split_talker_sentence(s: &str) -> (String, String) {
     if (s.starts_with('$') || s.starts_with('!')) && s.len() >= 6 {
         (s[1..3].to_string(), s[3..6].to_string())

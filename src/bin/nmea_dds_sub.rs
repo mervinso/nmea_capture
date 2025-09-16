@@ -1,3 +1,16 @@
+//! Segundo binario: **suscriptor DDS** de `NMEA/Raw`.
+/*!
+ Flujo:
+   - Se suscribe a `RawSentence`.
+   - Imprime cada muestra como NDJSON (`type="raw"`).
+   - Si `sentence` es `"RMC"` o `"GGA"`, parsea el campo `raw` y
+     publica objetos tipados en `NMEA/RMC` o `NMEA/GGA`.
+  Notas:
+   - El parseo es **tolerante**; convierte vacíos a `NaN` y usa `Option` implícita
+     (vía `NaN`→`null` en JSON) para campos no presentes.
+   - Todo corre con Tokio y APIs `*_async` de DustDDS.
+*/
+
 use clap::Parser;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
@@ -13,12 +26,15 @@ use dust_dds::{
     topic_definition::type_support::DdsType,
 };
 
-// Tipos RAW compartidos desde la misma crate
+//// Tipo tipado para **RMC** (Recommended Minimum Specific GNSS Data).
+/// `#[dust_dds(key)] seq` actúa como clave de instancia en DDS.
+/// Guardamos además `ts_unix_ms` del momento de recepción del raw.
 #[path = "../dds_types.rs"]
 mod dds_types;
 use dds_types::RawSentence;
 
-// ---------------------- Tipos tipados ----------------------
+/// Tipo tipado para **GGA** (Global Positioning System Fix Data).
+/// Incluye calidad de fix, nº de satélites y alturas. `seq` es la clave DDS.
 #[derive(Debug, Clone, DdsType)]
 pub struct Rmc {
     #[dust_dds(key)]
@@ -51,7 +67,10 @@ pub struct Gga {
     pub ts_unix_ms: i64,
 }
 
-// ---------------------- CLI ----------------------
+/// CLI del subscriber:
+/// - `--domain`: DomainId compartido con el publicador.
+/// - `--topic-raw`: tópico del que se lee (`RawSentence`).
+/// - `--topic-rmc`, `--topic-gga`: tópicos a los que se republica parseado.
 #[derive(Debug, Parser)]
 #[command(name = "nmea-dds-sub", about = "Subscribe NMEA/Raw, print NDJSON, republish RMC/GGA")]
 struct Cli {
@@ -65,7 +84,8 @@ struct Cli {
     topic_gga: String,
 }
 
-// ---------------------- WinSock (Windows) ----------------------
+/// Igual que en el capturador: inicialización segura de WinSock una única vez.
+/// Previene el error "WSAStartup failed" en sistemas donde aún no se inició.
 #[cfg(windows)]
 fn ensure_winsock() {
     use std::sync::Once;
@@ -78,7 +98,9 @@ fn ensure_winsock() {
     });
 }
 
-// ---------------------- Helpers JSON ----------------------
+/// Convierte `f64::NAN` → `null` al serializar a JSON.
+/// Así evitamos meter números inválidos en el NDJSON.
+/// Lo mismo para `f32`.
 fn f64_or_null(v: f64) -> Value {
     if v.is_nan() { Value::Null } else { json!(v) }
 }
@@ -86,7 +108,9 @@ fn f32_or_null(v: f32) -> Value {
     if v.is_nan() { Value::Null } else { json!(v) }
 }
 
-// ---------------------- Parsers NMEA ----------------------
+/// Obtiene el **vector de campos** (trozos separados por comas) que vienen
+/// **después** de `"$..RMC,"` / `"$..GGA,"`, ignorando el `*checksum` final.
+/// Devuelve `None` si la línea no contiene al menos una coma.
 // Corta lo que viene después de la primera coma tras $**RMC / $**GGA
 fn fields_after_first_comma(line: &str) -> Option<Vec<&str>> {
     let body = line.split_once('*').map(|(b, _)| b).unwrap_or(line);
@@ -95,7 +119,10 @@ fn fields_after_first_comma(line: &str) -> Option<Vec<&str>> {
     Some(rest.split(',').collect())
 }
 
-// ddmm.mmmm → (deg, min)
+/// Divide la cadena `ddmm.mmmm` en:
+/// - grados (`dd` o `ddd` según lat/lon)
+/// - minutos con decimales (`mm.mmmm`)
+/// Si no hay punto decimal, devuelve `NaN` para minutos.
 fn split_deg_min(v: &str) -> (u32, f64) {
     if let Some(idx) = v.find('.') {
         let mm_start = idx.saturating_sub(2);
@@ -105,6 +132,9 @@ fn split_deg_min(v: &str) -> (u32, f64) {
         (0, f64::NAN)
     }
 }
+
+/// Convierte latitud NMEA (`ddmm.mmmm` + hemisferio `N/S`) → grados decimales.
+/// Aplica signo negativo si hemisferio = 'S'.
 fn parse_lat(v: &str, hemi: &str) -> f64 {
     if v.is_empty() { return f64::NAN; }
     let (deg, min) = split_deg_min(v);
@@ -112,6 +142,11 @@ fn parse_lat(v: &str, hemi: &str) -> f64 {
     if matches!(hemi.chars().next(), Some('S')) { d = -d; }
     d
 }
+
+/// Parseo **tolerante** de una línea RMC:
+/// Campos esperados (mínimo 10): time,status,lat,NS,lon,EW,sog,cog,date,magvar,[magE/W],[mode]
+/// - Convierte ausencias a `NaN`/`'\0'`/`""`.
+/// - Incrementa `seq` y devuelve `Rmc` listo para publicar.
 fn parse_lon(v: &str, hemi: &str) -> f64 {
     if v.is_empty() { return f64::NAN; }
     let (deg, min) = split_deg_min(v);
@@ -120,6 +155,10 @@ fn parse_lon(v: &str, hemi: &str) -> f64 {
     d
 }
 
+/// Parseo **tolerante** de una línea GGA:
+/// Campos esperados (mínimo 11): time,lat,NS,lon,EW,fix,numsats,hdop,alt,M,geoid,M,...
+/// - Convierte ausencias a `NaN`/0.
+/// - Incrementa `seq` y devuelve `Gga`.
 fn parse_rmc(line: &str, ts_ms: i64, seq: &mut u64) -> Option<Rmc> {
     let f = fields_after_first_comma(line)?;
     // time,status,lat,NS,lon,EW,sog,cog,date,magvar,magE/W,mode?
@@ -183,7 +222,14 @@ fn parse_gga(line: &str, ts_ms: i64, seq: &mut u64) -> Option<Gga> {
     })
 }
 
-// ---------------------- main ----------------------
+/// 1) Inicializa logs (`RUST_LOG` o `info` por defecto).
+/// 2) Crea participante y los **tres** tópicos: Raw (reader) + RMC/GGA (writers).
+/// 3) Bucle principal:
+///    - `read_next_sample().await` (maneja `NoData` con sleep corto).
+///    - Imprime NDJSON `{"type":"raw",...}`.
+///    - Si `sentence` es `"RMC"` o `"GGA"`, parsea y **publica** tipado + imprime NDJSON.
+/// 4) No se hace `join` a multicast (se deja a DustDDS), así que los logs 10049
+///    por interfaces APIPA son informativos y no afectan el flujo unicast.
 #[tokio::main]
 async fn main() -> DdsResult<()> {
     #[cfg(windows)]

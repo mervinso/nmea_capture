@@ -1,3 +1,8 @@
+//! Divide un buffer (posible múltiple de líneas) por separadores CRLF.
+//! - Convierte a UTF-8 de forma tolerante (`from_utf8_lossy`) porque NMEA es ASCII.
+//! - Corta `\r\n` y también sanea `\r`/`\n` solitarios.
+//! - Devuelve un `Vec<String>` con **líneas sin terminadores**.
+//! Nota: no valida checksum ni formato; esa responsabilidad vive en el suscriptor.
 
 pub fn split_crlf_lines(buf: &[u8]) -> Vec<String> {
     // Convert lossily to avoid panics on odd bytes; NMEA should be ASCII
