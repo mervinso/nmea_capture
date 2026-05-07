@@ -390,7 +390,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "nema_capture"
+name = "network-interface"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a43439bf756eed340bdf8feba761e2d50c7d47175d87545cd5cbe4a137c4d1"
+dependencies = [
+ "cc",
+ "libc",
+ "thiserror",
+ "winapi",
+]
+
+[[package]]
+name = "nmea_capture"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -403,18 +415,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "network-interface"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a43439bf756eed340bdf8feba761e2d50c7d47175d87545cd5cbe4a137c4d1"
-dependencies = [
- "cc",
- "libc",
- "thiserror",
- "winapi",
 ]
 
 [[package]]

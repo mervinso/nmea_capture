@@ -12,9 +12,9 @@
 */
 
 use clap::Parser;
-use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
-use tracing::info;
+use serde_json::{Value, json};
+use tokio::time::{Duration, sleep};
+use tracing::debug;
 
 use dust_dds::{
     dds_async::domain_participant_factory::DomainParticipantFactoryAsync,
@@ -72,7 +72,10 @@ pub struct Gga {
 /// - `--topic-raw`: tópico del que se lee (`RawSentence`).
 /// - `--topic-rmc`, `--topic-gga`: tópicos a los que se republica parseado.
 #[derive(Debug, Parser)]
-#[command(name = "nmea-dds-sub", about = "Subscribe NMEA/Raw, print NDJSON, republish RMC/GGA")]
+#[command(
+    name = "nmea-dds-sub",
+    about = "Subscribe NMEA/Raw, print NDJSON, republish RMC/GGA"
+)]
 struct Cli {
     #[arg(long, default_value_t = 0)]
     domain: i32,
@@ -82,6 +85,9 @@ struct Cli {
     topic_rmc: String,
     #[arg(long, default_value = "NMEA/GGA")]
     topic_gga: String,
+    /// Human-readable output for terminal verification. Default output is NDJSON.
+    #[arg(long)]
+    pretty: bool,
 }
 
 /// Igual que en el capturador: inicialización segura de WinSock una única vez.
@@ -89,7 +95,7 @@ struct Cli {
 #[cfg(windows)]
 fn ensure_winsock() {
     use std::sync::Once;
-    use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
         let mut data = std::mem::MaybeUninit::<WSADATA>::uninit();
@@ -106,6 +112,65 @@ fn f64_or_null(v: f64) -> Value {
 }
 fn f32_or_null(v: f32) -> Value {
     if v.is_nan() { Value::Null } else { json!(v) }
+}
+
+fn f64_display(v: f64) -> String {
+    if v.is_nan() {
+        "-".to_string()
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+fn f32_display(v: f32) -> String {
+    if v.is_nan() {
+        "-".to_string()
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+fn print_raw_pretty(data: &RawSentence) {
+    println!(
+        "RAW id={:<6} {:>2}/{:<3} src={}:{} ts={} {}",
+        data.id,
+        data.talker,
+        data.sentence,
+        data.src.host,
+        data.src.port,
+        data.ts_unix_ms,
+        data.raw
+    );
+}
+
+fn print_rmc_pretty(r: &Rmc) {
+    println!(
+        "RMC seq={:<5} time={:<10} date={:<6} status={} lat={:>11} lon={:>11} sog={:>6}kn cog={:>6}deg mode={}",
+        r.seq,
+        r.utc_time,
+        r.utc_date,
+        r.status,
+        f64_display(r.lat_deg),
+        f64_display(r.lon_deg),
+        f32_display(r.sog_knots),
+        f32_display(r.cog_deg),
+        r.mode
+    );
+}
+
+fn print_gga_pretty(g: &Gga) {
+    println!(
+        "GGA seq={:<5} time={:<10} fix={} sats={:<2} lat={:>11} lon={:>11} hdop={:>5} alt={:>7}m geoid={:>7}m",
+        g.seq,
+        g.utc_time,
+        g.fix_quality,
+        g.num_sats,
+        f64_display(g.lat_deg),
+        f64_display(g.lon_deg),
+        f32_display(g.hdop),
+        f32_display(g.altitude_m),
+        f32_display(g.geoid_sep_m)
+    );
 }
 
 /// Obtiene el **vector de campos** (trozos separados por comas) que vienen
@@ -136,10 +201,14 @@ fn split_deg_min(v: &str) -> (u32, f64) {
 /// Convierte latitud NMEA (`ddmm.mmmm` + hemisferio `N/S`) → grados decimales.
 /// Aplica signo negativo si hemisferio = 'S'.
 fn parse_lat(v: &str, hemi: &str) -> f64 {
-    if v.is_empty() { return f64::NAN; }
+    if v.is_empty() {
+        return f64::NAN;
+    }
     let (deg, min) = split_deg_min(v);
     let mut d = deg as f64 + min / 60.0;
-    if matches!(hemi.chars().next(), Some('S')) { d = -d; }
+    if matches!(hemi.chars().next(), Some('S')) {
+        d = -d;
+    }
     d
 }
 
@@ -148,10 +217,14 @@ fn parse_lat(v: &str, hemi: &str) -> f64 {
 /// - Convierte ausencias a `NaN`/`'\0'`/`""`.
 /// - Incrementa `seq` y devuelve `Rmc` listo para publicar.
 fn parse_lon(v: &str, hemi: &str) -> f64 {
-    if v.is_empty() { return f64::NAN; }
+    if v.is_empty() {
+        return f64::NAN;
+    }
     let (deg, min) = split_deg_min(v);
     let mut d = deg as f64 + min / 60.0;
-    if matches!(hemi.chars().next(), Some('W')) { d = -d; }
+    if matches!(hemi.chars().next(), Some('W')) {
+        d = -d;
+    }
     d
 }
 
@@ -162,19 +235,36 @@ fn parse_lon(v: &str, hemi: &str) -> f64 {
 fn parse_rmc(line: &str, ts_ms: i64, seq: &mut u64) -> Option<Rmc> {
     let f = fields_after_first_comma(line)?;
     // time,status,lat,NS,lon,EW,sog,cog,date,magvar,magE/W,mode?
-    if f.len() < 10 { return None; }
+    if f.len() < 10 {
+        return None;
+    }
 
-    let utc_time  = f[0].to_string();
-    let status    = f.get(1).and_then(|s| s.chars().next()).unwrap_or('V');
-    let lat_deg   = parse_lat(f.get(2).copied().unwrap_or(""), f.get(3).copied().unwrap_or(""));
-    let lon_deg   = parse_lon(f.get(4).copied().unwrap_or(""), f.get(5).copied().unwrap_or(""));
-    let sog_knots = f.get(6).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
-    let cog_deg   = f.get(7).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
-    let utc_date  = f.get(8).copied().unwrap_or("").to_string();
-    let mag_var   = f.get(9).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
-    let mag_var_ew= f.get(10).and_then(|s| s.chars().next()).unwrap_or('\0');
-    let mode_idx  = if f.len() > 12 { 12 } else { 11 };
-    let mode      = f.get(mode_idx).copied().unwrap_or("").to_string();
+    let utc_time = f[0].to_string();
+    let status = f.get(1).and_then(|s| s.chars().next()).unwrap_or('V');
+    let lat_deg = parse_lat(
+        f.get(2).copied().unwrap_or(""),
+        f.get(3).copied().unwrap_or(""),
+    );
+    let lon_deg = parse_lon(
+        f.get(4).copied().unwrap_or(""),
+        f.get(5).copied().unwrap_or(""),
+    );
+    let sog_knots = f
+        .get(6)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
+    let cog_deg = f
+        .get(7)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
+    let utc_date = f.get(8).copied().unwrap_or("").to_string();
+    let mag_var = f
+        .get(9)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
+    let mag_var_ew = f.get(10).and_then(|s| s.chars().next()).unwrap_or('\0');
+    let mode_idx = if f.len() > 12 { 12 } else { 11 };
+    let mode = f.get(mode_idx).copied().unwrap_or("").to_string();
 
     *seq += 1;
     Some(Rmc {
@@ -196,16 +286,27 @@ fn parse_rmc(line: &str, ts_ms: i64, seq: &mut u64) -> Option<Rmc> {
 fn parse_gga(line: &str, ts_ms: i64, seq: &mut u64) -> Option<Gga> {
     let f = fields_after_first_comma(line)?;
     // time,lat,NS,lon,EW,fix,numsats,hdop,alt,M,geoid,M,…
-    if f.len() < 11 { return None; }
+    if f.len() < 11 {
+        return None;
+    }
 
-    let utc_time    = f[0].to_string();
-    let lat_deg     = parse_lat(f[1], f.get(2).copied().unwrap_or(""));
-    let lon_deg     = parse_lon(f[3], f.get(4).copied().unwrap_or(""));
+    let utc_time = f[0].to_string();
+    let lat_deg = parse_lat(f[1], f.get(2).copied().unwrap_or(""));
+    let lon_deg = parse_lon(f[3], f.get(4).copied().unwrap_or(""));
     let fix_quality = f.get(5).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    let num_sats    = f.get(6).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    let hdop        = f.get(7).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
-    let altitude_m  = f.get(8).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
-    let geoid_sep_m = f.get(10).and_then(|s| s.parse::<f32>().ok()).unwrap_or(f32::NAN);
+    let num_sats = f.get(6).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+    let hdop = f
+        .get(7)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
+    let altitude_m = f
+        .get(8)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
+    let geoid_sep_m = f
+        .get(10)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NAN);
 
     *seq += 1;
     Some(Gga {
@@ -235,7 +336,7 @@ async fn main() -> DdsResult<()> {
     #[cfg(windows)]
     ensure_winsock();
 
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -246,12 +347,19 @@ async fn main() -> DdsResult<()> {
     let args = Cli::parse();
 
     let dpf = DomainParticipantFactoryAsync::get_instance();
-    let participant =
-        dpf.create_participant(args.domain, QosKind::Default, None, NO_STATUS).await?;
+    let participant = dpf
+        .create_participant(args.domain, QosKind::Default, None, NO_STATUS)
+        .await?;
 
     // Topics
     let topic_raw = participant
-        .create_topic::<RawSentence>(&args.topic_raw, "RawSentence", QosKind::Default, None, NO_STATUS)
+        .create_topic::<RawSentence>(
+            &args.topic_raw,
+            "RawSentence",
+            QosKind::Default,
+            None,
+            NO_STATUS,
+        )
         .await?;
     let topic_rmc = participant
         .create_topic::<Rmc>(&args.topic_rmc, "Rmc", QosKind::Default, None, NO_STATUS)
@@ -261,13 +369,17 @@ async fn main() -> DdsResult<()> {
         .await?;
 
     // Sub + reader
-    let subscriber = participant.create_subscriber(QosKind::Default, None, NO_STATUS).await?;
+    let subscriber = participant
+        .create_subscriber(QosKind::Default, None, NO_STATUS)
+        .await?;
     let reader = subscriber
         .create_datareader::<RawSentence>(&topic_raw, QosKind::Default, None, NO_STATUS)
         .await?;
 
     // Pub + writers
-    let publisher = participant.create_publisher(QosKind::Default, None, NO_STATUS).await?;
+    let publisher = participant
+        .create_publisher(QosKind::Default, None, NO_STATUS)
+        .await?;
     let writer_rmc = publisher
         .create_datawriter::<Rmc>(&topic_rmc, QosKind::Default, None, NO_STATUS)
         .await?;
@@ -284,14 +396,18 @@ async fn main() -> DdsResult<()> {
                 let data = sample.data()?;
 
                 // 1) RAW → NDJSON
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "type": "raw",
-                        "data": data
-                    }))
+                if args.pretty {
+                    print_raw_pretty(&data);
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "type": "raw",
+                            "data": data
+                        }))
                         .unwrap()
-                );
+                    );
+                }
 
                 // 2) parse y republica tipado + NDJSON
                 match data.sentence.as_str() {
@@ -299,48 +415,56 @@ async fn main() -> DdsResult<()> {
                         if let Some(r) = parse_rmc(&data.raw, data.ts_unix_ms, &mut seq_rmc) {
                             let _ = writer_rmc.write(&r, None).await;
 
-                            let obj = json!({
-                                "type": "rmc",
-                                "data": {
-                                    "seq": r.seq,
-                                    "utc_time": r.utc_time,
-                                    "utc_date": r.utc_date,
-                                    "status": r.status,
-                                    "lat_deg": f64_or_null(r.lat_deg),
-                                    "lon_deg": f64_or_null(r.lon_deg),
-                                    "sog_knots": f32_or_null(r.sog_knots),
-                                    "cog_deg": f32_or_null(r.cog_deg),
-                                    "mag_var": f32_or_null(r.mag_var),
-                                    "mag_var_ew": r.mag_var_ew,
-                                    "mode": r.mode,
-                                    "ts_unix_ms": r.ts_unix_ms
-                                }
-                            });
-                            println!("{}", serde_json::to_string(&obj).unwrap());
-                            info!(?r, "republished RMC");
+                            if args.pretty {
+                                print_rmc_pretty(&r);
+                            } else {
+                                let obj = json!({
+                                    "type": "rmc",
+                                    "data": {
+                                        "seq": r.seq,
+                                        "utc_time": r.utc_time,
+                                        "utc_date": r.utc_date,
+                                        "status": r.status,
+                                        "lat_deg": f64_or_null(r.lat_deg),
+                                        "lon_deg": f64_or_null(r.lon_deg),
+                                        "sog_knots": f32_or_null(r.sog_knots),
+                                        "cog_deg": f32_or_null(r.cog_deg),
+                                        "mag_var": f32_or_null(r.mag_var),
+                                        "mag_var_ew": r.mag_var_ew,
+                                        "mode": r.mode,
+                                        "ts_unix_ms": r.ts_unix_ms
+                                    }
+                                });
+                                println!("{}", serde_json::to_string(&obj).unwrap());
+                            }
+                            debug!(?r, "republished RMC");
                         }
                     }
                     "GGA" => {
                         if let Some(g) = parse_gga(&data.raw, data.ts_unix_ms, &mut seq_gga) {
                             let _ = writer_gga.write(&g, None).await;
 
-                            let obj = json!({
-                                "type": "gga",
-                                "data": {
-                                    "seq": g.seq,
-                                    "utc_time": g.utc_time,
-                                    "lat_deg": f64_or_null(g.lat_deg),
-                                    "lon_deg": f64_or_null(g.lon_deg),
-                                    "fix_quality": g.fix_quality,
-                                    "num_sats": g.num_sats,
-                                    "hdop": f32_or_null(g.hdop),
-                                    "altitude_m": f32_or_null(g.altitude_m),
-                                    "geoid_sep_m": f32_or_null(g.geoid_sep_m),
-                                    "ts_unix_ms": g.ts_unix_ms
-                                }
-                            });
-                            println!("{}", serde_json::to_string(&obj).unwrap());
-                            info!(?g, "republished GGA");
+                            if args.pretty {
+                                print_gga_pretty(&g);
+                            } else {
+                                let obj = json!({
+                                    "type": "gga",
+                                    "data": {
+                                        "seq": g.seq,
+                                        "utc_time": g.utc_time,
+                                        "lat_deg": f64_or_null(g.lat_deg),
+                                        "lon_deg": f64_or_null(g.lon_deg),
+                                        "fix_quality": g.fix_quality,
+                                        "num_sats": g.num_sats,
+                                        "hdop": f32_or_null(g.hdop),
+                                        "altitude_m": f32_or_null(g.altitude_m),
+                                        "geoid_sep_m": f32_or_null(g.geoid_sep_m),
+                                        "ts_unix_ms": g.ts_unix_ms
+                                    }
+                                });
+                                println!("{}", serde_json::to_string(&obj).unwrap());
+                            }
+                            debug!(?g, "republished GGA");
                         }
                     }
                     _ => {}

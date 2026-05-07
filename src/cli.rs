@@ -60,7 +60,6 @@ pub struct Cli {
     pub json_pretty: bool,
 }
 
-
 /// Método de ayuda para traducir `-v/-q` a filtro de `tracing`.
 /// Se usa en `main.rs` para inicializar `EnvFilter`.
 #[derive(Debug, Copy, Clone, ValueEnum)]

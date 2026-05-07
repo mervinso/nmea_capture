@@ -51,7 +51,7 @@ Proyecto en Rust que:
 ## Estructura del repo
 
 ```bash
-nema_capture/
+nmea_capture/
 ├─ Cargo.toml
 ├─ src/
 │  ├─ main.rs              # bin nmea-capture
@@ -73,8 +73,8 @@ nema_capture/
 Clona el repo y entra en la carpeta:
 
 ```powershell
-git clone https://github.com/mervinso/nema_capture.git
-cd nema_capture
+git clone https://github.com/mervinso/nmea_capture.git
+cd nmea_capture
 ```
 Compila una vez:
 
@@ -107,10 +107,11 @@ cargo run --release --bin nmea_dds_sub -- `
   --domain 0 `
   --topic-raw "NMEA/Raw" `
   --topic-rmc "NMEA/RMC" `
-  --topic-gga "NMEA/GGA"
+  --topic-gga "NMEA/GGA" `
+  --pretty
 ```
 
-En cuanto lleguen sentencias, verás NDJSON tipo `raw` y, para RMC/GGA, objetos `type="rmc"' / 'type="gga"` más logs `republished RMC/GGA`.
+En cuanto lleguen sentencias, verás una salida legible con líneas `RAW`, `RMC` y `GGA`. Si necesitas NDJSON compacto para procesar con herramientas externas, omite `--pretty`.
 
 ---
 
@@ -137,6 +138,7 @@ Parámetros CLI
 --topic-raw <name>      (def: "NMEA/Raw")
 --topic-rmc <name>      (def: "NMEA/RMC")
 --topic-gga <name>      (def: "NMEA/GGA")
+--pretty                (salida organizada para verificación en terminal)
 ```
 
 

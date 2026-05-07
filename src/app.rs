@@ -9,9 +9,9 @@ use crate::net::udp::UdpReceiver;
 use crate::nmea::split_crlf_lines;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use tokio::{signal, sync::mpsc};
 use tracing::{debug, info};
-use serde_json::json;
 
 // DDS
 use dust_dds::{
@@ -26,7 +26,7 @@ use dust_dds::{
 #[cfg(windows)]
 fn ensure_winsock() {
     use std::sync::Once;
-    use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
         let mut data = std::mem::MaybeUninit::<WSADATA>::uninit();
@@ -48,17 +48,18 @@ pub async fn run(cfg: Cli) -> Result<()> {
     // Tarea **productora UDP**:
     // - Enlaza `UdpReceiver` al `bind`.
     // - En bucle, recibe datagramas y los manda por `tx`.
-    // - Si no puede enlazar, aborta con `expect` (error visible en arranque).
-    {
+    // - Si no puede enlazar, devuelve error al flujo principal.
+    let mut udp_task = {
         let bind = cfg.bind.clone();
         let tx2 = tx.clone();
         tokio::spawn(async move {
             let mut rxr = UdpReceiver::bind(&bind)
                 .await
-                .expect("failed to bind UDP socket");
-            rxr.run(tx2).await.expect("udp loop failed");
-        });
-    }
+                .context("failed to bind UDP socket")?;
+            rxr.run(tx2).await.context("udp loop failed")
+        })
+    };
+    drop(tx);
 
     info!("Listening on UDP {}", cfg.bind);
     let with_ts = cfg.timestamp;
@@ -84,7 +85,13 @@ pub async fn run(cfg: Cli) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         let topic = participant
-            .create_topic::<RawSentence>(&cfg.dds_topic_raw, "RawSentence", QosKind::Default, None, NO_STATUS)
+            .create_topic::<RawSentence>(
+                &cfg.dds_topic_raw,
+                "RawSentence",
+                QosKind::Default,
+                None,
+                NO_STATUS,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
@@ -98,7 +105,10 @@ pub async fn run(cfg: Cli) -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-        info!("DDS enabled: domain={} topic={}", cfg.dds_domain, cfg.dds_topic_raw);
+        info!(
+            "DDS enabled: domain={} topic={}",
+            cfg.dds_domain, cfg.dds_topic_raw
+        );
         dds_writer = Some(writer);
     }
 
@@ -118,8 +128,8 @@ pub async fn run(cfg: Cli) -> Result<()> {
                 }
 
                 let (talker, sentence) = split_talker_sentence(&line);
-                let ts_iso = chrono::Local::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let ts_iso =
+                    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
                 // 1) imprimir por consola
                 if json {
@@ -171,10 +181,20 @@ pub async fn run(cfg: Cli) -> Result<()> {
 
     // Mecanismo de salida ordenada:
     // - `signal::ctrl_c().await` bloquea hasta CTRL+C.
-    // - Al liberar `rx`, la tarea consumidora terminará el bucle.
+    // - Se aborta la tarea UDP para liberar su sender y cerrar el canal.
     // - `printer.await` sincroniza el cierre y permite registrar "Printer loop ended".
-    signal::ctrl_c().await.context("waiting for Ctrl+C failed")?;
-    info!("Ctrl+C received, shutting down…");
+    tokio::select! {
+        signal = signal::ctrl_c() => {
+            signal.context("waiting for Ctrl+C failed")?;
+            info!("Ctrl+C received, shutting down...");
+            udp_task.abort();
+            let _ = udp_task.await;
+        }
+        result = &mut udp_task => {
+            result.context("UDP task panicked")??;
+        }
+    }
+
     let _ = printer.await;
     Ok(())
 }
